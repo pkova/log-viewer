@@ -39,6 +39,33 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# GLFW (Linux GUI driver). Cocoa/Metal on macOS and Win32/DX11 on Windows
+# already cover the windowing/rendering layer there; on Linux we use GLFW
+# + OpenGL3, which is the standard ImGui combination.
+#
+# At build time you need the X11 (and optionally Wayland) -dev packages.
+# Debian/Ubuntu: sudo apt install libgl1-mesa-dev libx11-dev libxrandr-dev \
+#                                  libxinerama-dev libxcursor-dev libxi-dev \
+#                                  libwayland-dev libxkbcommon-dev
+# Fedora/RHEL: sudo dnf install mesa-libGL-devel libX11-devel libXrandr-devel \
+#                                libXinerama-devel libXcursor-devel libXi-devel \
+#                                wayland-devel libxkbcommon-devel
+# ---------------------------------------------------------------------------
+if(UNIX AND NOT APPLE)
+  set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
+  set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(glfw
+    URL      https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz
+    URL_HASH SHA256=c038d34200234d071fae9345bc455e4a8f2f544ab966188e2d068fd8f3f989fb
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+  FetchContent_MakeAvailable(glfw)
+
+  find_package(OpenGL REQUIRED)
+endif()
+
+# ---------------------------------------------------------------------------
 # Vendored LMDB (built as a tiny static library)
 # ---------------------------------------------------------------------------
 add_library(lmdb STATIC
@@ -116,9 +143,12 @@ elseif(WIN32)
   )
   target_link_libraries(imgui PUBLIC d3d11 dxgi d3dcompiler dwmapi)
 else()
-  message(FATAL_ERROR
-    "log-viewer GUI driver is not yet implemented for this platform. "
-    "Add an imgui backend choice (e.g. GLFW + OpenGL3) to CMakeLists.txt.")
+  add_library(imgui STATIC
+    ${IMGUI_CORE_SOURCES}
+    third_party/imgui/imgui_impl_glfw.cpp
+    third_party/imgui/imgui_impl_opengl3.cpp
+  )
+  target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 endif()
 target_include_directories(imgui PUBLIC third_party/imgui)
 if(NOT MSVC)
@@ -142,7 +172,7 @@ if(APPLE)
 elseif(WIN32)
   list(APPEND LV_SOURCES src/gui_win32.cpp src/http_win32.cpp)
 else()
-  list(APPEND LV_SOURCES src/http_posix.cpp)
+  list(APPEND LV_SOURCES src/gui_linux.cpp src/http_posix.cpp)
 endif()
 
 add_executable(log-viewer ${LV_SOURCES})

@@ -17,6 +17,21 @@
 
 static std::string g_initial_path;
 
+// MTKView subclass that swallows keyboard events. ImGui_ImplOSX installs a
+// global NSEvent monitor that runs *before* the responder chain, so it
+// already sees every keystroke. By overriding keyDown:/keyUp: to do
+// nothing (and acceptsFirstResponder=YES so we sit at the head of the
+// chain), we stop AppKit from interpreting unhandled keys as "no widget
+// wanted this — beep!" on every arrow press.
+@interface QuietMTKView : MTKView
+@end
+@implementation QuietMTKView
+- (BOOL)acceptsFirstResponder { return YES; }
+- (void)keyDown:(NSEvent*)event       { (void)event; }
+- (void)keyUp:(NSEvent*)event         { (void)event; }
+- (void)flagsChanged:(NSEvent*)event  { (void)event; }
+@end
+
 @interface AppViewController : NSViewController <MTKViewDelegate, NSWindowDelegate>
 @property (nonatomic, strong) id<MTLDevice>       device;
 @property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
@@ -39,7 +54,9 @@ static std::string g_initial_path;
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   ImGuiIO& io = ImGui::GetIO();
-  io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+  // Intentionally NOT enabling NavEnableKeyboard: we want the arrow keys
+  // to step through events (handled in Viewer::draw), not jump focus
+  // between widgets. Textbox cursor movement still works either way.
   io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
   ImGui::StyleColorsDark();
 
@@ -55,7 +72,7 @@ static std::string g_initial_path;
 - (MTKView*)mtkView { return (MTKView*)self.view; }
 
 - (void)loadView {
-  self.view = [[MTKView alloc] initWithFrame:CGRectMake(0, 0, 1280, 800)];
+  self.view = [[QuietMTKView alloc] initWithFrame:CGRectMake(0, 0, 1280, 800)];
 }
 
 - (void)viewDidLoad {

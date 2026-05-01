@@ -135,7 +135,9 @@ int run_gui(const char* initial_path) {
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   ImGuiIO& io = ImGui::GetIO();
-  io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+  // Intentionally NOT enabling NavEnableKeyboard: we want the arrow keys
+  // to step through events (handled in Viewer::draw), not jump focus
+  // between widgets. Textbox cursor movement still works either way.
   io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
   ImGui::StyleColorsDark();
   ImGui_ImplWin32_Init(hwnd);
