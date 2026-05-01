@@ -7,6 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace cue {
 
@@ -15,7 +20,19 @@ namespace {
 static Noun* const NONE = (Noun*)(uintptr_t)-1;
 
 inline u32 mask3(u32 x) { return x & 0x7u; }
-inline u8  tz8(u8 x)    { return (u8)__builtin_ctz((unsigned)x); }
+
+// Count trailing zeros of an 8-bit byte. clang/gcc have a builtin; MSVC
+// has _BitScanForward which writes the index to its first arg and returns
+// 0 when the input is 0 (undefined for our callers, who always pass nonzero).
+inline u8 tz8(u8 x) {
+#if defined(_MSC_VER)
+  unsigned long idx;
+  _BitScanForward(&idx, (unsigned long)x);
+  return (u8)idx;
+#else
+  return (u8)__builtin_ctz((unsigned)x);
+#endif
+}
 inline u64 mn(u64 a, u64 b) { return a < b ? a : b; }
 
 void* arena_alloc(Arena* a, size objsize, size align, size count) {

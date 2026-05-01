@@ -5,6 +5,7 @@
 #include <string.h>
 #include <algorithm>
 #include <functional>
+#include <iterator>
 #include <vector>
 
 #include "imgui.h"
@@ -494,7 +495,8 @@ bool decode_uv(const char* in, size_t in_len, std::vector<uint8_t>* out) {
   // is the lowest base-32 digit (least significant), which corresponds to
   // bits 0..4 of the value (= atom-byte 0 low nibble).
   out->clear();
-  for (ssize_t i = (ssize_t)in_len - 1; i >= 0; i--) {
+  // intptr_t (signed, pointer-sized) instead of ssize_t — MSVC has no ssize_t.
+  for (intptr_t i = (intptr_t)in_len - 1; i >= 0; i--) {
     char c = in[i];
     if (c == '.') continue;
     int d;
