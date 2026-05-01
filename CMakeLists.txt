@@ -58,7 +58,7 @@ if(UNIX AND NOT APPLE)
   set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(glfw
     URL      https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz
-    URL_HASH SHA256=c038d34200234d071fae9345bc455e4a8f2f544ab966188e2d068fd8f3f989fb
+    URL_HASH SHA256=c038d34200234d071fae9345bc455e4a8f2f544ab60150765d7704e08f3dac01
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
   FetchContent_MakeAvailable(glfw)
 
