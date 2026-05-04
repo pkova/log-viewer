@@ -133,9 +133,20 @@ class Viewer {
   std::atomic<uint64_t>                    index_version_{0};
 
   // Decryption: only the user's own networking ring/seed is needed. Peer
-  // pubkeys + lives (and our own life) come from the network-explorer API,
-  // looked up asynchronously and cached by ship value.
+  // pubkeys + lives come from the network-explorer API, looked up
+  // asynchronously and cached by ship value. We *don't* fetch ourselves
+  // — moons aren't in the API and the receiver's pubkey isn't part of
+  // the X25519 derivation.
   std::string our_seed_hex_;
+  int         our_life_ = 1;
+  // Observed receiver patp from the first %hear we successfully parsed.
+  // Every packet in our log has us as the rcvr, so we read it off the
+  // wire instead of asking the user to type their ship name. Used by
+  // chum-candidate logic in format_heer / fine to skip self lookups.
+  // Written by index workers (under mutex) and by load_event in the
+  // foreground; read in build_hear_keys.
+  std::mutex  observed_mu_;
+  std::string observed_our_ship_;
 
   // "Fake" mode — keys are deterministically derived from the ship atom
   // per +pit:nu:crub:crypto in vane/jael.hoon (the %fake boot path).

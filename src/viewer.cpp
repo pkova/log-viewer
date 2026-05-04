@@ -479,6 +479,14 @@ using PeerResolver = std::function<ResolvedPeer(const std::string& patp)>;
 struct HearKeys {
   bool          have_seed = false;
   uint8_t       our_seed[32]{};
+  // Our own life (the rcvr in every %hear in our log). The receiver's
+  // pubkey isn't needed for X25519 — only its life is, as part of the
+  // AES-SIV associated data — so we never fetch ourselves from the
+  // network-explorer API. That fetch was failing for moons (which the
+  // explorer doesn't index) and stalling chum-decryption when we
+  // happened to be the chum's `her`.
+  int           our_life  = 1;
+  std::string   our_ship;            // optional; see chum-candidate skip below
   PeerResolver  resolve;
 };
 
@@ -852,6 +860,14 @@ bool format_heer(cue::Noun* e, std::string* out, const HearKeys& keys) {
     std::string last_note;
     bool any_pending = false;
     for (const std::string& cand : candidates) {
+      // Never resolve ourselves — chum-decryption uses the OTHER party's
+      // pubkey + our seed. Skipping prevents the resolver from queuing a
+      // network-explorer lookup that would fail (moons aren't indexed)
+      // and stall the data-decrypt path.
+      if (!keys.our_ship.empty() && cand == keys.our_ship) {
+        last_note = cand + ": (self)";
+        continue;
+      }
       ResolvedPeer peer = keys.resolve(cand);
       if (!peer.ok) {
         if (peer.pending) any_pending = true;
@@ -1712,24 +1728,22 @@ bool format_hear(cue::Noun* e, std::string* out, const HearKeys& keys) {
     if (keys.have_seed) {
       s += "\n";
       std::string sndr_patp = patp::from_bytes(bytes + sndr_off, sndr_size);
-      std::string rcvr_patp = patp::from_bytes(bytes + rcvr_off, rcvr_size);
       ResolvedPeer sndr_info = keys.resolve ? keys.resolve(sndr_patp) : ResolvedPeer{};
-      ResolvedPeer rcvr_info = keys.resolve ? keys.resolve(rcvr_patp) : ResolvedPeer{};
+      // We never resolve the receiver: we *are* the receiver, the
+      // receiver's pubkey is not part of the X25519 derivation, and only
+      // the receiver's life (= our own life) ends up in the AES-SIV AD.
+      // That comes from `keys.our_life`, set on identity setup.
       auto status_line = [](const char* who, const ResolvedPeer& info) {
-        // While the network fetcher is in flight, the resolver returns
-        // pending=true with note="fetching ~ship". Surface that verbatim
-        // so the user knows we're waiting, not failing.
         if (info.pending) return std::string("decrypt: ") + info.note + "\n";
         return std::string("decrypt: ") + who + " lookup failed: " +
                info.note + "\n";
       };
       if (!sndr_info.ok) { s += status_line("sndr", sndr_info); return true; }
-      if (!rcvr_info.ok) { s += status_line("rcvr", rcvr_info); return true; }
       DecryptResult dr = try_decrypt_hear(
           bytes + content_off, content_size,
           bytes + sndr_off, sndr_size, sndr_tick,
           bytes + rcvr_off, rcvr_size, rcvr_tick,
-          keys.our_seed,    rcvr_info.life,
+          keys.our_seed,    keys.our_life,
           sndr_info.pub,    sndr_info.life);
       if (!dr.ok) {
         s += "decrypt: ";
@@ -1808,6 +1822,11 @@ bool format_hear(cue::Noun* e, std::string* out, const HearKeys& keys) {
     if (ps.size() < 5 || ps[1] != "chum") return "";
     const std::string& ship = ps[2];
     const std::string& enc  = ps[ps.size() - 1];
+    if (!keys.our_ship.empty() && ship == keys.our_ship) {
+      // Don't resolve ourselves — see the matching note in format_heer's
+      // try_decrypt_chum.
+      return "(self path; need a peer-encoded chum to decrypt)";
+    }
     ResolvedPeer peer = keys.resolve(ship);
     if (!peer.ok) {
       if (peer.pending) return peer.note;  // "fetching ~ship"
@@ -2075,6 +2094,10 @@ void Viewer::close() {
   sender_filter_built_at_ = (uint64_t)-1;
   sender_filter_built_for_.clear();
   combined_filter_eves_.clear();
+  {
+    std::lock_guard<std::mutex> g(observed_mu_);
+    observed_our_ship_.clear();
+  }
   index_version_.store(0);
 }
 
@@ -2267,6 +2290,8 @@ void Viewer::load_event(uint64_t eve) {
       }
       lv_crypto::derive_fake_seed(our_bytes, our_size, hk.our_seed);
       hk.have_seed = true;
+      hk.our_life  = 1;
+      hk.our_ship  = fake_ship_name_;
       hk.resolve = [](const std::string& patp_name) -> ResolvedPeer {
         ResolvedPeer rp{};
         uint8_t bytes[16] = {0};
@@ -2287,6 +2312,11 @@ void Viewer::load_event(uint64_t eve) {
     if (parse_seed(our_seed_hex_, seed)) {
       hk.have_seed = true;
       memcpy(hk.our_seed, seed, 32);
+      hk.our_life  = our_life_;
+      {
+        std::lock_guard<std::mutex> g(observed_mu_);
+        hk.our_ship = observed_our_ship_;
+      }
       hk.resolve = [this](const std::string& patp_name) -> ResolvedPeer {
         ResolvedPeer rp{};
         std::lock_guard<std::mutex> g(node_mu_);
@@ -2475,11 +2505,14 @@ static std::string extract_sender_patp(const std::string& task, cue::Noun* evt_n
                 | ((uint32_t)bytes[3] << 24);
     bool     relayed = ((hed >> 31) & 1) == 0;  // hoon-loobean: 0=yes
     uint32_t sac     = (hed >>  7) & 0x3;
+    uint32_t rac     = (hed >>  9) & 0x3;
     static const int sizes[4] = {2, 4, 8, 16};
     int sndr_size = sizes[sac];
+    int rcvr_size = sizes[rac];
     size_t off = relayed ? 10 : 4;       // skip header (+ origin if relayed)
-    if (off + 1 + (size_t)sndr_size > blob_size) return "";
+    if (off + 1 + (size_t)sndr_size + (size_t)rcvr_size > blob_size) return "";
     off += 1;                            // skip tick byte
+    (void)rcvr_size;
     return patp::from_bytes(bytes + off, sndr_size);
   }
   if (task == "%heer") {
@@ -2508,6 +2541,37 @@ static std::string extract_sender_patp(const std::string& task, cue::Noun* evt_n
     return patp::from_bytes(n2.ship_bytes, n2.ship_size);
   }
   return "";
+}
+
+// Mirror of extract_sender_patp for the receiver side, only meaningful
+// for %hear (ames/fine) packets — mesa packets don't carry an explicit
+// receiver. Every %hear in our log was directed at us, so the rcvr we
+// pull out here is our own ship name. Used to populate
+// observed_our_ship_ so we can self-skip during chum decryption.
+static std::string extract_receiver_patp(const std::string& task,
+                                         cue::Noun* evt_n) {
+  if (task != "%hear" || !cue::is_cell(evt_n)) return "";
+  cue::Noun* blob = cue::tail(evt_n);
+  if (cue::is_cell(blob) || blob->len < 8) return "";
+  size_t blob_size = (size_t)blob->len;
+  const uint8_t* bytes = (blob->len > 8)
+      ? (const uint8_t*)(uintptr_t)blob->val
+      : (const uint8_t*)&blob->val;
+
+  uint32_t hed = (uint32_t)bytes[0]
+              | ((uint32_t)bytes[1] <<  8)
+              | ((uint32_t)bytes[2] << 16)
+              | ((uint32_t)bytes[3] << 24);
+  bool     relayed = ((hed >> 31) & 1) == 0;
+  uint32_t sac     = (hed >>  7) & 0x3;
+  uint32_t rac     = (hed >>  9) & 0x3;
+  static const int sizes[4] = {2, 4, 8, 16};
+  int sndr_size = sizes[sac];
+  int rcvr_size = sizes[rac];
+  size_t off = relayed ? 10 : 4;       // skip header (+ origin if relayed)
+  if (off + 1 + (size_t)sndr_size + (size_t)rcvr_size > blob_size) return "";
+  off += 1 + (size_t)sndr_size;        // skip tick + sndr
+  return patp::from_bytes(bytes + off, rcvr_size);
 }
 
 // ---- background API fetcher ----------------------------------------------
@@ -2712,6 +2776,18 @@ void Viewer::index_worker(size_t wi, uint64_t lo, uint64_t hi) {
           std::string sndr = extract_sender_patp(name, evt_n);
           if (!sndr.empty()) local_senders[sndr].push_back(eve);
         }
+        // Capture our own ship from the first %hear we see — every
+        // packet in our log was directed at us, so the rcvr field is
+        // our ship. Used downstream to self-skip during chum decryption
+        // (which would otherwise queue a doomed network-explorer fetch
+        // for our own moon).
+        if (evt_n && name == "%hear") {
+          std::lock_guard<std::mutex> g(observed_mu_);
+          if (observed_our_ship_.empty()) {
+            std::string r = extract_receiver_patp(name, evt_n);
+            if (!r.empty()) observed_our_ship_ = std::move(r);
+          }
+        }
         if (wire_n && name == "%request") {
           cue::print_wire(wbuf.data(), wbuf.size(), wire_n);
           local_request_wires[(const char*)wbuf.data()].push_back(eve);
@@ -2807,6 +2883,26 @@ void Viewer::draw() {
         changed = true;
       }
       ImGui::PopItemWidth();
+
+      // We deduce our own ship from the rcvr field of the first %hear
+      // event we see (background indexer captures it) — every packet in
+      // our log is addressed to us. Only `your life` still needs user
+      // input, since the rcvr life isn't on the wire.
+      ImGui::PushItemWidth(120);
+      if (ImGui::InputInt("your life", &our_life_)) {
+        if (our_life_ < 1) our_life_ = 1;
+        changed = true;
+      }
+      ImGui::PopItemWidth();
+      {
+        std::lock_guard<std::mutex> g(observed_mu_);
+        ImGui::SameLine();
+        if (observed_our_ship_.empty()) {
+          ImGui::TextDisabled("your ship: (waiting for a %%hear event)");
+        } else {
+          ImGui::TextDisabled("your ship: %s", observed_our_ship_.c_str());
+        }
+      }
 
       uint8_t tmp[32];
       bool seed_ok = parse_seed(our_seed_hex_, tmp);
