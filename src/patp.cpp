@@ -132,19 +132,27 @@ int ship_lz(const Ship& s) {
   return lz;
 }
 
-std::string ship_to_patq(const Ship& s) {
-  if (s.hed == 0 && s.tel == 0) return "~zod";
+// Core syllable renderer: emit exactly `n` bytes from `s` (atom-LSB byte
+// order, so byte 0 is the lowest). The two auras differ only in how they
+// pick `n`:
+//   @p  — n is the rank-implied size (galaxy=1, star=2, planet=4,
+//         moon=8, comet=16). Leading zero bytes are kept; otherwise
+//         e.g. a planet whose obfuscated high byte happens to be 0 (the
+//         prefix `doz` is index 0) loses a syllable and ~dozreg-toplud
+//         renders as ~reg-toplud.
+//   @q  — n is the minimum needed to represent the value, leading zero
+//         bytes stripped. ~reg-toplud is the correct @q for the same
+//         3-byte atom that ~dozreg-toplud is the @p for.
+// The dash rule (a "--" between groups of 4 syllables) is shared.
+std::string render_syllables(const Ship& s, int n) {
+  if (n <= 0) return "~zod";
   const char (*tables[2])[4] = { suffixes, prefixes };
-  int lz = ship_lz(s);
-  int top = 15 - lz;
+  int top = n - 1;
   std::string r = "~";
   for (int i = top; i >= 0; i--) {
     uint8_t byt = ((const uint8_t*)&s)[i];
     r += tables[i % 2][byt];
     if ((i % 2) == 0 && i != 0) {
-      // Step boundary (between byte-pairs). Per urbit-ob's `patp`, every
-      // 4th step gets a "--" instead of a single "-" — that's the boundary
-      // between the moon-half and the planet-half within a comet.
       int step_done = (top - i) / 2 + 1;
       r += (step_done % 4 == 0) ? "--" : "-";
     }
@@ -152,26 +160,43 @@ std::string ship_to_patq(const Ship& s) {
   return r;
 }
 
-// Apply urbit-ob's `fein` Feistel obfuscation to the ship value:
-//   v < 0x10000           : galaxy/star, no obfuscation
-//   0x10000 ≤ v < 2^32    : planet — feisob the entire 32-bit value
-//   2^32 ≤ v < 2^64       : moon — keep the high 32 bits raw, recursively
-//                           feisob the low 32 bits (only if they are
-//                           themselves in planet range)
-//   v ≥ 2^64              : comet — no obfuscation
+// @q rendering — strip leading zero bytes. Useful for atoms-as-text
+// (e.g. dumping a cord), distinct from ship rendering. Currently kept
+// available even though we don't yet route any caller through it.
+[[maybe_unused]] std::string ship_to_patq(const Ship& s) {
+  if (s.hed == 0 && s.tel == 0) return "~zod";
+  int lz = ship_lz(s);
+  return render_syllables(s, 16 - lz);
+}
+
+// Apply urbit-ob's `fein` Feistel obfuscation to the ship value, then
+// render with the rank-implied byte count (so a planet always emits 4
+// bytes, a moon 8, etc., regardless of leading zeros after obfuscation):
+//   v < 0x100             : galaxy (1 byte)         — no obfuscation
+//   0x100 ≤ v < 0x10000   : star   (2 bytes)        — no obfuscation
+//   0x10000 ≤ v < 2^32    : planet (4 bytes)        — feisob the value
+//   2^32 ≤ v < 2^64       : moon   (8 bytes)        — feisob low 32 bits
+//   v ≥ 2^64              : comet  (16 bytes)       — no obfuscation
 std::string ship_to_patp(const Ship& s) {
   if (s.hed == 0 && s.tel == 0) return "~zod";
   Ship p = s;
-  if (s.tel == 0) {
-    if (s.hed >= 0x100000000ULL) {
-      uint32_t lo = (uint32_t)s.hed;
-      uint32_t obf = (lo < b_w) ? lo : feisob(lo);
-      p.hed = (s.hed & 0xFFFFFFFF00000000ULL) | (uint64_t)obf;
-    } else if (s.hed >= b_w) {
-      p.hed = feisob((uint32_t)s.hed);
-    }
+  int  n;
+  if (s.tel != 0) {
+    n = 16;
+  } else if (s.hed >= 0x100000000ULL) {
+    n = 8;
+    uint32_t lo = (uint32_t)s.hed;
+    uint32_t obf = (lo < b_w) ? lo : feisob(lo);
+    p.hed = (s.hed & 0xFFFFFFFF00000000ULL) | (uint64_t)obf;
+  } else if (s.hed >= b_w) {
+    n = 4;
+    p.hed = feisob((uint32_t)s.hed);
+  } else if (s.hed >= 0x100ULL) {
+    n = 2;
+  } else {
+    n = 1;
   }
-  return ship_to_patq(p);
+  return render_syllables(p, n);
 }
 
 }  // namespace
