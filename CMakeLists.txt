@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
+# CMP0091 lets us pick the MSVC runtime library via CMAKE_MSVC_RUNTIME_LIBRARY
+# (the modern, generator-expression-aware way) instead of patching /MD → /MT
+# in compile flags by hand. Must be NEW before project() so the policy is
+# active when targets get created downstream.
+if(POLICY CMP0091)
+  cmake_policy(SET CMP0091 NEW)
+endif()
+
 # OBJCXX is only meaningful on Apple targets; gate the language list so the
 # Visual Studio + Ninja Windows generators don't trip over it.
 if(APPLE)
@@ -13,6 +21,16 @@ set(CMAKE_C_STANDARD_REQUIRED   ON)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(APPLE)
   set(CMAKE_OBJCXX_STANDARD 17)
+endif()
+
+# Statically link the MSVC C++ runtime (vcruntime140 / msvcp140 / ucrt).
+# Otherwise the .exe needs the user's machine to have the Visual C++
+# Redistributable installed, which a stock Windows 10 box typically does
+# not — the binary fails to load before main() with a "DLL missing"
+# error. /MT-style linking makes a self-contained binary at the cost of
+# a few hundred KB of size; well worth the deployability.
+if(WIN32)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -166,6 +184,7 @@ set(LV_SOURCES
   src/patp.cpp
   src/crypto.cpp
   src/api.cpp
+  src/profile.cpp
 )
 if(APPLE)
   list(APPEND LV_SOURCES src/gui_macos.mm src/http_posix.cpp)
@@ -185,7 +204,11 @@ if(WIN32)
   # in transitively through <windows.h>.
   target_link_libraries(log-viewer PRIVATE winhttp bcrypt ws2_32)
   target_compile_definitions(log-viewer PRIVATE
-    NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
+    NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE
+    # Pin the API level to Windows 10. The VS 2022 default with the
+    # Win 11 SDK is 0x0A00 anyway, but stating it explicitly stops a
+    # stray Win-11-only declaration from sneaking into a release build.
+    _WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000000)
   if(MSVC)
     # Use windowed subsystem for release builds; console for debug so
     # printf() from --probe is visible. The /SUBSYSTEM setting is only

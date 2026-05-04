@@ -9,6 +9,7 @@ namespace cli {
 int run_probe(int argc, const char* argv[]);
 int run_crypto_test();
 int run_pubkey(int argc, const char* argv[]);
+int run_bench(int argc, const char* argv[]);
 
 }  // namespace cli
 

@@ -10,6 +10,7 @@
 
 #include "imgui.h"
 #include "patp.h"
+#include "profile.h"
 #include "crypto.h"
 #include "api.h"
 
@@ -718,6 +719,7 @@ std::vector<std::string> split_path(const uint8_t* p, size_t n) {
 }
 
 bool format_heer(cue::Noun* e, std::string* out, const HearKeys& keys) {
+  LV_PROFILE_BLOCK("format_heer/total");
   std::string& s = *out;
   s.clear();
 
@@ -831,6 +833,7 @@ bool format_heer(cue::Noun* e, std::string* out, const HearKeys& keys) {
     std::vector<uint8_t>  sealed;
   };
   auto try_decrypt_chum = [&](const MesaName& nm, const char* indent) -> ChumKey {
+    LV_PROFILE_BLOCK("format_heer/try_decrypt_chum");
     ChumKey ck;
     if (!keys.have_seed || !keys.resolve) return ck;
     auto parts = split_path(nm.path, nm.path_len);
@@ -927,18 +930,31 @@ bool format_heer(cue::Noun* e, std::string* out, const HearKeys& keys) {
     // in the runtime driver — the event log only ever sees the full
     // message, so dat IS the entire jammed payload (no partial fragments).
     if (d.frag_len > 0 && data_key.ok) {
+      LV_PROFILE_BLOCK("format_heer/data_decrypt+cue");
       std::vector<uint8_t> pt;
-      if (lv_crypto::mesa_decrypt_data(data_key.sym_key,
-                                       data_key.sealed.data(),
-                                       data_key.sealed.size(),
-                                       d.frag, d.frag_len, &pt)) {
-        cue::Arena perm    = cue::make_arena(kArenaCap);
-        cue::Arena stack   = cue::make_arena(kArenaCap);
-        cue::Arena scratch = cue::make_arena(kArenaCap);
+      bool mesa_ok;
+      {
+        LV_PROFILE_BLOCK("format_heer/mesa_decrypt_data");
+        mesa_ok = lv_crypto::mesa_decrypt_data(
+            data_key.sym_key, data_key.sealed.data(),
+            data_key.sealed.size(), d.frag, d.frag_len, &pt);
+      }
+      if (mesa_ok) {
+        cue::Arena perm, stack, scratch;
+        {
+          LV_PROFILE_BLOCK("format_heer/arena_make x3");
+          perm    = cue::make_arena(kArenaCap);
+          stack   = cue::make_arena(kArenaCap);
+          scratch = cue::make_arena(kArenaCap);
+        }
         cue::Noun* msg = nullptr;
-        cue::CueRes rc = cue::cue(pt.data(), pt.size(),
-                                  &perm, &stack, &scratch, &msg);
+        cue::CueRes rc;
+        {
+          LV_PROFILE_BLOCK("format_heer/cue_gage");
+          rc = cue::cue(pt.data(), pt.size(), &perm, &stack, &scratch, &msg);
+        }
         if (rc == cue::CUE_GOOD && msg) {
+          LV_PROFILE_BLOCK("format_heer/format_mesa_gage");
           s += "  payload (gage):\n";
           format_mesa_gage(&s, msg, "    ");
         } else {
@@ -956,9 +972,12 @@ bool format_heer(cue::Noun* e, std::string* out, const HearKeys& keys) {
           if (pt.size() > shown) s += "...";
           s += "\n";
         }
-        cue::free_arena(&perm);
-        cue::free_arena(&stack);
-        cue::free_arena(&scratch);
+        {
+          LV_PROFILE_BLOCK("format_heer/arena_free x3");
+          cue::free_arena(&perm);
+          cue::free_arena(&stack);
+          cue::free_arena(&scratch);
+        }
       } else {
         s += "  payload: decrypt failed (sentinel byte missing?)\n";
       }
@@ -1127,11 +1146,25 @@ DecryptResult try_decrypt_hear(
   return r;
 }
 
+// Per-thread scratch buffer for cue::print_* into. Sized once and reused
+// across calls — replacing the per-call 4 MiB std::vector that dominated
+// nav profiles when stepping through %heer events with full chum
+// decryption (each event's gage walked the noun-pretty printer many
+// times, each call mallocing+freeing 4 MiB).
+//
+// Safe under recursion because every caller copies the rendered bytes
+// into its own std::string before returning, so subsequent re-stamps of
+// the buffer don't disturb earlier results.
+static std::vector<uint8_t>& fmt_scratch() {
+  thread_local std::vector<uint8_t> b(kFormatCap);
+  return b;
+}
+
 // Render an arbitrary noun via cue::print_noun into the string.
 void append_noun(std::string* s, cue::Noun* n) {
-  std::vector<uint8_t> tmp(kFormatCap);
-  cue::print_noun(tmp.data(), tmp.size(), n);
-  *s += (const char*)tmp.data();
+  auto& tmp = fmt_scratch();
+  size_t len = (size_t)cue::print_noun(tmp.data(), tmp.size(), n);
+  s->append((const char*)tmp.data(), len);
 }
 
 // Walk a noun's right-spine; fills `items` with each head and sets `term`
@@ -1160,7 +1193,7 @@ static bool is_null_atom(cue::Noun* n) {
 //     with d as the final element (tuple).
 constexpr size_t kPrettyInline = 96;
 void append_noun_pretty(std::string* s, cue::Noun* n, const std::string& indent) {
-  std::vector<uint8_t> tmp(kFormatCap);
+  auto& tmp = fmt_scratch();
   size_t inline_len = (size_t)cue::print_noun(tmp.data(), tmp.size(), n);
   if (!cue::is_cell(n) || inline_len + indent.size() <= kPrettyInline) {
     s->append((const char*)tmp.data(), inline_len);
@@ -2005,6 +2038,7 @@ Viewer::Viewer() {
   perm_    = cue::make_arena(kArenaCap);
   stack_   = cue::make_arena(kArenaCap);
   scratch_ = cue::make_arena(kArenaCap);
+  fmt_buf_.resize(kFormatCap);
   // Clipboard hook is installed lazily in draw(): ImGui_ImplOSX_Init runs
   // *after* our constructor and would overwrite anything we put here.
 }
@@ -2119,6 +2153,7 @@ void Viewer::refresh_bounds() {
 }
 
 void Viewer::load_event(uint64_t eve) {
+  LV_PROFILE_BLOCK("load_event/total");
   if (!env_) return;
 
   cue::reset_arena(&perm_);
@@ -2129,17 +2164,23 @@ void Viewer::load_event(uint64_t eve) {
   MDB_dbi  dbi;
   int err;
 
-  if ((err = mdb_txn_begin(env_, nullptr, MDB_RDONLY, &txn))) {
-    error_ = fmt_path_lock_warning(err); return;
-  }
-  if ((err = mdb_dbi_open(txn, "EVENTS", MDB_INTEGERKEY, &dbi))) {
-    error_ = fmt_path_lock_warning(err); mdb_txn_abort(txn); return;
+  {
+    LV_PROFILE_BLOCK("load_event/txn_begin+dbi_open");
+    if ((err = mdb_txn_begin(env_, nullptr, MDB_RDONLY, &txn))) {
+      error_ = fmt_path_lock_warning(err); return;
+    }
+    if ((err = mdb_dbi_open(txn, "EVENTS", MDB_INTEGERKEY, &dbi))) {
+      error_ = fmt_path_lock_warning(err); mdb_txn_abort(txn); return;
+    }
   }
 
   MDB_val key, val;
   key.mv_size = sizeof(eve);
   key.mv_data = &eve;
-  err = mdb_get(txn, dbi, &key, &val);
+  {
+    LV_PROFILE_BLOCK("load_event/mdb_get");
+    err = mdb_get(txn, dbi, &key, &val);
+  }
   if (err) {
     error_ = fmt_path_lock_warning(err);
     mdb_txn_abort(txn);
@@ -2153,9 +2194,13 @@ void Viewer::load_event(uint64_t eve) {
   memcpy(&mug_, val.mv_data, 4);
 
   cue::Noun* n = nullptr;
-  cue::CueRes res = cue::cue((const uint8_t*)val.mv_data + 4,
-                             val.mv_size - 4,
-                             &perm_, &stack_, &scratch_, &n);
+  cue::CueRes res;
+  {
+    LV_PROFILE_BLOCK("load_event/cue_main");
+    res = cue::cue((const uint8_t*)val.mv_data + 4,
+                   val.mv_size - 4,
+                   &perm_, &stack_, &scratch_, &n);
+  }
   if (res != cue::CUE_GOOD || n == nullptr) {
     error_ = "failed to deserialize event";
     mdb_txn_abort(txn);
@@ -2168,7 +2213,7 @@ void Viewer::load_event(uint64_t eve) {
   // events have a different shape (mug == 0). Walk defensively: at every
   // step the current node must be a cell, otherwise we fall back to
   // dumping the raw deserialized noun.
-  std::vector<uint8_t> buf(kFormatCap);
+  std::vector<uint8_t>& buf = fmt_buf_;  // reused; allocated once in ctor
   time_.clear(); wire_.clear(); task_.clear(); data_.clear();
 
   auto dump_raw = [&]() {
@@ -2187,11 +2232,14 @@ void Viewer::load_event(uint64_t eve) {
   cue::Noun* task_n = cue::head(rest2);
   cue::Noun* evt_n  = cue::tail(rest2);
 
-  cue::print_da(buf.data(), buf.size(), date_n);
-  time_.assign((char*)buf.data());
+  {
+    LV_PROFILE_BLOCK("load_event/print_da+wire+task");
+    cue::print_da(buf.data(), buf.size(), date_n);
+    time_.assign((char*)buf.data());
 
-  cue::print_wire(buf.data(), buf.size(), wire_n);
-  wire_.assign((char*)buf.data());
+    cue::print_wire(buf.data(), buf.size(), wire_n);
+    wire_.assign((char*)buf.data());
+  }
 
   if (cue::is_cell(task_n)) {
     // Some events nest the task; just dump the noun.
@@ -2273,6 +2321,7 @@ void Viewer::load_event(uint64_t eve) {
     return hk;
   };
 
+  LV_PROFILE_BLOCK("load_event/dispatch");
   if (task_ == "%request") {
     format_request(evt_n, &data_);
   } else if (task_ == "%receive") {
@@ -2352,7 +2401,10 @@ void Viewer::load_event(uint64_t eve) {
     data_.assign((char*)buf.data());
   }
 
-  mdb_txn_abort(txn);
+  {
+    LV_PROFILE_BLOCK("load_event/txn_abort");
+    mdb_txn_abort(txn);
+  }
 }
 
 // Decode the task cord from a single jammed event using thread-local
@@ -2521,6 +2573,31 @@ void Viewer::wait_for_pending_fetches() {
     }
     return true;
   });
+}
+
+void Viewer::wait_for_indexing() {
+  using namespace std::chrono_literals;
+  while (true) {
+    bool all_done = !shards_.empty();
+    for (auto& sp : shards_) {
+      if (!sp->done.load(std::memory_order_relaxed)) { all_done = false; break; }
+    }
+    if (all_done) return;
+    std::this_thread::sleep_for(20ms);
+  }
+}
+
+std::vector<uint64_t> Viewer::events_for_task(const std::string& name) {
+  std::vector<uint64_t> out;
+  for (auto& sp : shards_) {
+    std::lock_guard<std::mutex> g(sp->mu);
+    auto it = sp->tasks.find(name);
+    if (it != sp->tasks.end())
+      out.insert(out.end(), it->second.begin(), it->second.end());
+  }
+  // Each shard owns a disjoint, ascending event-num range and stores
+  // events in scan order, so the concatenation is already sorted.
+  return out;
 }
 
 void Viewer::stop_indexing() {

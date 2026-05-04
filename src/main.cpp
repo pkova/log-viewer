@@ -12,6 +12,7 @@ int main(int argc, const char* argv[]) {
   if (argc > 1 && strcmp(argv[1], "--test")   == 0) return cli::run_crypto_test();
   if (argc > 1 && strcmp(argv[1], "--pubkey") == 0) return cli::run_pubkey(argc, argv);
   if (argc > 1 && strcmp(argv[1], "--probe")  == 0) return cli::run_probe(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "--bench")  == 0) return cli::run_bench(argc, argv);
 
   const char* initial_path = (argc > 1) ? argv[1] : nullptr;
   return run_gui(initial_path);

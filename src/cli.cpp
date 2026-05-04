@@ -8,11 +8,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <chrono>
 #include <string>
 #include <vector>
 
 #include "viewer.h"
 #include "crypto.h"
+#include "profile.h"
 
 extern "C" void crypto_eddsa_scalarbase(uint8_t point[32],
                                         const uint8_t scalar[32]);
@@ -174,6 +176,85 @@ int run_pubkey(int argc, const char* argv[]) {
   fprintf(stderr, "api-format (MSB-first):\n  0x");
   for (int i = 31; i >= 0; i--) fprintf(stderr, "%02x", pub[i]);
   fprintf(stderr, "\n");
+  return 0;
+}
+
+// Benchmark mode: simulate arrow-key navigation through the first N
+// events of a given task, dumping per-section profile buckets.
+//
+//   log-viewer --bench <path> [--task %heer] [--count 100] [--seed HEX]
+//                              [--fake ~ship]
+int run_bench(int argc, const char* argv[]) {
+  if (argc < 3) {
+    fprintf(stderr,
+        "usage: %s --bench <path> [--task %%heer] [--count 100] "
+        "[--seed HEX] [--fake ~ship]\n", argv[0]);
+    return 2;
+  }
+  std::string path  = argv[2];
+  std::string task  = "%heer";
+  int         count = 100;
+  std::string seed;
+  std::string fake_ship;
+  for (int i = 3; i + 1 < argc; i += 2) {
+    std::string k = argv[i], v = argv[i + 1];
+    if      (k == "--task")  task = v;
+    else if (k == "--count") count = atoi(v.c_str());
+    else if (k == "--seed")  seed = v;
+    else if (k == "--fake")  fake_ship = v;
+  }
+
+  Viewer v;
+  if (!v.open(path, /*start_index=*/true)) {
+    fprintf(stderr, "open failed\n");
+    return 1;
+  }
+  if (!seed.empty())      v.set_identity(seed);
+  if (!fake_ship.empty()) v.set_fake_ship(fake_ship);
+
+  fprintf(stderr, "indexing %s...\n", path.c_str());
+  v.wait_for_indexing();
+
+  auto eves = v.events_for_task(task);
+  fprintf(stderr, "%s indexed: %zu events\n", task.c_str(), eves.size());
+  if (eves.empty()) return 1;
+
+  if ((size_t)count > eves.size()) count = (int)eves.size();
+
+  // In real mode (--seed without --fake) the peer-pubkey resolver enqueues
+  // network fetches lazily and returns pending=true until they complete.
+  // The slow path the user actually hits in the GUI is post-warmup, with
+  // every peer already cached, so do a warmup pass first: load each event
+  // once to enqueue fetches, then block until the fetcher drains. Skip
+  // for fake mode (already deterministic) and for "no keys" (nothing to
+  // fetch).
+  if (!seed.empty() && fake_ship.empty()) {
+    fprintf(stderr, "warming peer-key cache (loading %d events)...\n", count);
+    for (int i = 0; i < count; i++) v.load_event(eves[(size_t)i]);
+    fprintf(stderr, "waiting for pending fetches...\n");
+    v.wait_for_pending_fetches();
+    // Some events depend on peers that only became visible after the
+    // first pass returned them; do a second pass + drain to settle.
+    for (int i = 0; i < count; i++) v.load_event(eves[(size_t)i]);
+    v.wait_for_pending_fetches();
+    fprintf(stderr, "warmup done.\n");
+  }
+
+  lv::g_profile = true;
+
+  auto t_start = std::chrono::steady_clock::now();
+  for (int i = 0; i < count; i++) {
+    LV_PROFILE_BLOCK("bench/load_event_total");
+    v.load_event(eves[(size_t)i]);
+  }
+  auto dt = std::chrono::steady_clock::now() - t_start;
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(dt).count();
+
+  fprintf(stderr, "\nstepped %d %s events in %lld ms (%.2f ms/event)\n\n",
+          count, task.c_str(), (long long)ms,
+          count ? (double)ms / (double)count : 0.0);
+
+  lv::profile_dump();
   return 0;
 }
 

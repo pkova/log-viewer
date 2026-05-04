@@ -59,6 +59,22 @@ class Viewer {
     our_seed_hex_ = seed_hex;
   }
 
+  // Block until every indexing shard reports done. Used by --bench to
+  // make sure the per-task event lists are stable before stepping
+  // through them.
+  void wait_for_indexing();
+
+  // Snapshot the indexed event-numbers for a task (e.g. "%heer"), in
+  // ascending order. Empty if no shard has seen the task yet.
+  std::vector<uint64_t> events_for_task(const std::string& name);
+
+  // Test setter for --bench: enable fake-mode decryption with the given
+  // ship name. Mirrors the UI checkbox + textbox path.
+  void set_fake_ship(const std::string& patp_name) {
+    fake_mode_      = true;
+    fake_ship_name_ = patp_name;
+  }
+
  private:
   void refresh_bounds();
   void start_indexing();
@@ -81,6 +97,12 @@ class Viewer {
   cue::Arena perm_;
   cue::Arena stack_;
   cue::Arena scratch_;
+
+  // Reusable scratch buffer for cue::print_* into. Sized once at open()
+  // and reused per event so we don't pay a 4 MiB malloc + free on every
+  // arrow-key step. (Profiling showed those two operations dominated
+  // load_event when stepping through %heer events.)
+  std::vector<uint8_t> fmt_buf_;
 
   // formatted strings for the current event
   std::string time_;

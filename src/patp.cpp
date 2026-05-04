@@ -136,25 +136,41 @@ std::string ship_to_patq(const Ship& s) {
   if (s.hed == 0 && s.tel == 0) return "~zod";
   const char (*tables[2])[4] = { suffixes, prefixes };
   int lz = ship_lz(s);
+  int top = 15 - lz;
   std::string r = "~";
-  for (int i = 15 - lz; i >= 0; i--) {
+  for (int i = top; i >= 0; i--) {
     uint8_t byt = ((const uint8_t*)&s)[i];
     r += tables[i % 2][byt];
-    if ((i % 2) == 0 && i != 0) r += "-";
+    if ((i % 2) == 0 && i != 0) {
+      // Step boundary (between byte-pairs). Per urbit-ob's `patp`, every
+      // 4th step gets a "--" instead of a single "-" — that's the boundary
+      // between the moon-half and the planet-half within a comet.
+      int step_done = (top - i) / 2 + 1;
+      r += (step_done % 4 == 0) ? "--" : "-";
+    }
   }
   return r;
 }
 
+// Apply urbit-ob's `fein` Feistel obfuscation to the ship value:
+//   v < 0x10000           : galaxy/star, no obfuscation
+//   0x10000 ≤ v < 2^32    : planet — feisob the entire 32-bit value
+//   2^32 ≤ v < 2^64       : moon — keep the high 32 bits raw, recursively
+//                           feisob the low 32 bits (only if they are
+//                           themselves in planet range)
+//   v ≥ 2^64              : comet — no obfuscation
 std::string ship_to_patp(const Ship& s) {
-  int lz = ship_lz(s);
-  int sz = 8 - (lz / 2);
-  if (sz < 2 || sz > 4) return ship_to_patq(s);
-  if (sz == 2) {
-    Ship p{ feisob((uint32_t)s.hed), 0 };
-    return ship_to_patq(p);
+  if (s.hed == 0 && s.tel == 0) return "~zod";
+  Ship p = s;
+  if (s.tel == 0) {
+    if (s.hed >= 0x100000000ULL) {
+      uint32_t lo = (uint32_t)s.hed;
+      uint32_t obf = (lo < b_w) ? lo : feisob(lo);
+      p.hed = (s.hed & 0xFFFFFFFF00000000ULL) | (uint64_t)obf;
+    } else if (s.hed >= b_w) {
+      p.hed = feisob((uint32_t)s.hed);
+    }
   }
-  if (((const uint32_t*)&s)[0] < b_w) return ship_to_patq(s);
-  Ship p{ feisob((uint32_t)s.hed), 0 };
   return ship_to_patq(p);
 }
 
@@ -229,39 +245,68 @@ bool to_bytes(const std::string& patp_str, uint8_t* out, int max_size,
     sylls.push_back(patp_str.substr(i, 3));
     i += 3;
   }
-  if (sylls.empty() || sylls.size() > 4 || sylls.size() == 3) return false;
+  // Accept 1 (galaxy), 2 (star pre-feistel), 4 (planet), 8 (moon), 16
+  // (comet) syllables. Anything else is malformed.
+  size_t ns = sylls.size();
+  if (ns != 1 && ns != 2 && ns != 4 && ns != 8 && ns != 16) return false;
 
-  uint64_t atom = 0;
-  int      ship_size = 0;
-  if (sylls.size() == 1) {
+  // Decode every syllable into its byte value. Even-index syllables are
+  // prefixes, odd-index are suffixes. Galaxy (single syllable) is a
+  // special case: only a suffix.
+  uint8_t bytes[16] = {0};
+  if (ns == 1) {
     uint8_t b;
     if (!suffix_lookup(sylls[0], &b)) return false;
-    atom = b;
-    ship_size = 2;                  // galaxies share rank 0 with stars
-  } else if (sylls.size() == 2) {
-    uint8_t p, s;
-    if (!prefix_lookup(sylls[0], &p)) return false;
-    if (!suffix_lookup(sylls[1], &s)) return false;
-    atom = ((uint64_t)p << 8) | s;
+    bytes[0] = b;
+  } else {
+    // ship_to_patq emits byte (top - i) at syllable position i, with
+    // top = ns - 1. So syllable i decodes into byte (ns - 1 - i).
+    for (size_t i = 0; i < ns; i++) {
+      uint8_t v;
+      bool ok = (i % 2 == 0) ? prefix_lookup(sylls[i], &v)
+                             : suffix_lookup(sylls[i], &v);
+      if (!ok) return false;
+      bytes[ns - 1 - i] = v;
+    }
+  }
+
+  // Reverse the Feistel obfuscation. Mirrors `fein` in ship_to_patp:
+  //   - galaxy/star (1-2 bytes effective): no obfuscation
+  //   - planet (4 bytes): defeisob the whole 32-bit value when it sits in
+  //                       the planet range
+  //   - moon (8 bytes): defeisob the LOW 32 bits only; high 32 bits raw
+  //   - comet (16 bytes): no obfuscation
+  if (ns == 4 || ns == 8) {
+    uint32_t lo = (uint32_t)bytes[0]
+                | ((uint32_t)bytes[1] <<  8)
+                | ((uint32_t)bytes[2] << 16)
+                | ((uint32_t)bytes[3] << 24);
+    if (lo >= b_w) lo = defeisob(lo);
+    bytes[0] = (uint8_t)(lo);
+    bytes[1] = (uint8_t)(lo >> 8);
+    bytes[2] = (uint8_t)(lo >> 16);
+    bytes[3] = (uint8_t)(lo >> 24);
+  }
+
+  // Determine the wire ship size: galaxies and stars share rank 0 (2 B),
+  // planets are rank 1 (4 B), moons rank 2 (8 B), comets rank 3 (16 B).
+  int ship_size;
+  if (ns == 16)        ship_size = 16;
+  else if (ns == 8)    ship_size = 8;
+  else if (ns == 4) {
+    // After defeisob, value < b_w means it shrunk into star range.
+    uint64_t v = (uint64_t)bytes[0]
+               | ((uint64_t)bytes[1] <<  8)
+               | ((uint64_t)bytes[2] << 16)
+               | ((uint64_t)bytes[3] << 24);
+    ship_size = (v < b_w) ? 2 : 4;
+  } else {
     ship_size = 2;
-  } else {                          // 4 syllables — planet (or feisob'd star)
-    uint8_t p1, s1, p2, s2;
-    if (!prefix_lookup(sylls[0], &p1)) return false;
-    if (!suffix_lookup(sylls[1], &s1)) return false;
-    if (!prefix_lookup(sylls[2], &p2)) return false;
-    if (!suffix_lookup(sylls[3], &s2)) return false;
-    uint32_t v = ((uint32_t)p1 << 24) | ((uint32_t)s1 << 16)
-               | ((uint32_t)p2 <<  8) |  (uint32_t)s2;
-    if (v >= b_w) v = defeisob(v);  // strip the planet/star feistel
-    atom = v;
-    ship_size = (atom < b_w) ? 2 : 4;
   }
 
   if (ship_size > max_size) return false;
   *actual_size = ship_size;
-  for (int b = 0; b < ship_size; b++) {
-    out[b] = (uint8_t)((atom >> (b * 8)) & 0xff);
-  }
+  for (int b = 0; b < ship_size; b++) out[b] = bytes[b];
   return true;
 }
 
